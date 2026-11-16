@@ -2,10 +2,27 @@
 // @indexs 1
 // @author lampon
 // @description 豆瓣推荐爬虫脚本
-// @version 1.0.8
+// @version 1.0.10
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/导航/豆瓣推荐.js
 
 const OmniBox = require("omnibox_sdk");
+
+// 兼容性说明（OmniBox 3.x）：
+// 旧版脚本在 home() 中曾调用 OmniBox.getAnalyzeSites()，但其返回值从未被使用。
+// 该函数在新版 OmniBox 已被移除，调用会抛 TypeError，且原调用位于 try 之外，
+// 会导致 home() 整体失败、接口返回 500，故此处直接移除该废弃调用。
+// 日志增加兜底，避免 SDK 函数变动时因日志异常中断主流程。
+async function safeLog(level, message) {
+  try {
+    if (OmniBox && typeof OmniBox.log === "function") {
+      await OmniBox.log(level, message);
+      return;
+    }
+  } catch (_) {
+    // 忽略日志失败，不影响主流程
+  }
+  console.log(`[${level}] ${message}`);
+}
 
 // 导出接口
 module.exports = {
@@ -28,7 +45,6 @@ function buildDoubanSubjectLink(vodId) {
  * @returns {Object} 返回分类列表和推荐视频列表
  */
 async function home(params, context) {
-  const sites = await OmniBox.getAnalyzeSites();
   try {
     // 构建分类列表
     const classes = [
@@ -149,7 +165,7 @@ async function home(params, context) {
       }
     } catch (bannerError) {
       // Banner获取失败不影响首页数据返回
-      await OmniBox.log("warn", `获取Banner数据失败: ${bannerError.message}`);
+      await safeLog("warn", `获取Banner数据失败: ${bannerError.message}`);
     }
 
     // 构建筛选条件
@@ -621,7 +637,7 @@ async function home(params, context) {
       }
     } catch (listError) {
       // 列表获取失败不影响首页数据返回
-      await OmniBox.log("warn", `获取首页列表数据失败: ${listError.message}`);
+      await safeLog("warn", `获取首页列表数据失败: ${listError.message}`);
     }
 
     return {
