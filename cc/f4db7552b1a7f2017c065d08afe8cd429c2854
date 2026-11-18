@@ -1,0 +1,18 @@
+导航/豆瓣推荐.js
+  h_dd364bd5be1770 5-6
+影视/采集/爱奇艺资源站.js
+  h_dd364bd5be1770 5-6
+模板/JavaScript/豆瓣推荐.js
+  h_dd364bd5be1770 5-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ccf4db7552b1a7f2017c065d08afe8cd429c2854",
+  "prompts": {},
+  "humans": {
+    "h_dd364bd5be1770": {
+      "author": "zhao-wuyan <59789646+zhao-wuyan@users.noreply.github.com>"
+    }
+  }
+}
