@@ -2,7 +2,7 @@
 // @author
 // @description 刮削：支持，弹幕：支持，播放记录：支持
 // @dependencies: axios, cheerio
-// @version 1.1.0
+// @version 1.1.1
 // @downloadURL https://gh-proxy.org/https://github.com/zhao-wuyan/OmniBox-Spider/raw/refs/heads/fixed/动漫/稀饭动漫.js
 
 /**
@@ -21,9 +21,10 @@
  *            其中 sources[] 为合法 JSON，做括号配对后可直接 JSON.parse
  *   - 播放页：视频直链由前端播放器运行时获取，服务端 HTML 不含 m3u8，
  *            因此优先用 SDK 的 sniffVideo 嗅探，失败则交给 OmniBox 解析
- *
- * 注意：站点搜索结果由前端渲染，服务端 /search?q= 返回空列表。
- *       search() 按站点真实接口实现，站点修复后即可直接生效。
+ *   - 搜索：站点 /search?q= 由前端渲染、服务端恒返回空列表，
+ *          真正可用的搜索走它自己的 Supabase PostgREST：
+ *          https://api.xifanacg.com/rest/v1/animes（支持中文/日文/拼音、分页、精确总数）
+ *          兜底 https://api.xifanacg.com/rest/v1/rpc/suggest_animes
  * ============================================================================
  */
 
@@ -34,6 +35,25 @@ const runner = require("spider_runner");
 
 // 站点真实 SSR 域名。dm.xifanacg.com 对子路由一律回退到首页，不能用
 const HOST = "https://next.xifanacg.com";
+// 站点数据层是 Supabase，搜索/列表走它自己的 PostgREST（publishable key 为公开只读 key）
+const API_HOST = "https://api.xifanacg.com";
+const API_KEY = "sb_publishable_OBIVAWACIX6lPXrO98_z24_HcsmalkA";
+const API_PAGE_SIZE = 24;
+const SEARCH_SELECT = [
+  "id",
+  "title",
+  "title_original",
+  "cover_url",
+  "format",
+  "type_id",
+  "release_year",
+  "bangumi_score",
+  "current_episodes",
+  "total_episodes",
+  "is_finished",
+  "remarks",
+  "view_count",
+].join(",");
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const PAGE_SIZE = 24;
 const DANMU_API = process.env.DANMU_API || "";
@@ -48,6 +68,21 @@ const axiosInstance = axios.create({
   },
   httpsAgent: new (require("https").Agent)({ rejectUnauthorized: false }),
   maxRedirects: 5,
+});
+
+// Supabase PostgREST 客户端（只读）。注意不能走 axios 的 params，
+// 否则逻辑树里的括号/逗号会被二次编码，PostgREST 解析报 PGRST100
+const apiInstance = axios.create({
+  timeout: 20000,
+  headers: {
+    "User-Agent": UA,
+    apikey: API_KEY,
+    authorization: `Bearer ${API_KEY}`,
+    "content-type": "application/json",
+    Referer: HOST + "/",
+  },
+  httpsAgent: new (require("https").Agent)({ rejectUnauthorized: false }),
+  maxRedirects: 3,
 });
 
 const CLASSES = [
@@ -315,18 +350,102 @@ async function category(params = {}) {
   }
 }
 
-async function search(params = {}) {
-  const keyword = String(params.keyword || params.key || params.wd || "").trim();
-  const page = Math.max(Number(params.page || params.pg || 1) || 1, 1);
-  if (!keyword) return { page, pagecount: 0, total: 0, list: [], keyword };
+/** Supabase 行 -> OmniBox 列表项 */
+function mapApiRow(row) {
+  if (!row || !row.id) return null;
+  const total = Number(row.total_episodes || 0);
+  const current = Number(row.current_episodes || 0);
+  let remarks = String(row.remarks || "").trim();
+  if (!remarks) {
+    if (row.is_finished && (total || current)) remarks = `全${total || current}集`;
+    else if (current) remarks = `更新至${current}集`;
+  }
+  return {
+    vod_id: `/anime/${row.id}`,
+    vod_name: String(row.title || "").trim(),
+    vod_pic: String(row.cover_url || "").trim(),
+    vod_year: row.release_year ? String(row.release_year) : "",
+    vod_remarks: remarks,
+  };
+}
 
+/**
+ * PostgREST 的逻辑树用 "," 和 "()" 做分隔，关键词里带这些字符会把
+ * or=(...) 解析坏掉（PGRST100）。这里按标点切成几段，取最长的一段，
+ * 再去掉其余会破坏语法的字符。取不到可用片段时返回空串，走 RPC 兜底。
+ */
+function sanitizeKeyword(keyword) {
+  const base = String(keyword || "").trim();
+  if (!base) return "";
+  const parts = base
+    .split(/[,，、]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const picked = parts.sort((a, b) => b.length - a.length)[0] || base;
+  return picked.replace(/[()*"%\\&?=]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** 从 Content-Range（形如 "0-23/57"、或空集时的星号斜杠 0）里取总数 */
+function parseTotal(contentRange) {
+  const m = String(contentRange || "").match(/\/(\d+)\s*$/);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * 兜底搜索：站点自带的联想 RPC，服务端匹配标题/原名/别名/拼音，
+ * 对含标点的关键词最稳，但最多只返回 20 条且不能翻页。
+ */
+async function searchBySuggest(keyword) {
+  const { data } = await apiInstance.post("/rest/v1/rpc/suggest_animes", {
+    q: keyword,
+    lim: 24,
+  });
+  if (!Array.isArray(data)) return [];
+  return data.map(mapApiRow).filter(Boolean);
+}
+
+async function search(params = {}) {
+  const keyword = String(params.keyword || params.key || params.wd || params.text || "").trim();
+  const page = Math.max(Number(params.page || params.pg || 1) || 1, 1);
+  if (!keyword) return { page, pagecount: 0, total: 0, limit: 0, list: [], keyword };
+
+  const safe = sanitizeKeyword(keyword);
+
+  // 主路径：直接查 animes 表，支持分页与精确总数
+  if (safe) {
+    try {
+      const pattern = `*${safe}*`;
+      const offset = (page - 1) * API_PAGE_SIZE;
+      const url =
+        `${API_HOST}/rest/v1/animes?select=${SEARCH_SELECT}` +
+        `&is_published=eq.true` +
+        `&or=(search_title.ilike.${encodeURIComponent(pattern)},` +
+        `pinyin_name.ilike.${encodeURIComponent(pattern)})` +
+        `&order=bangumi_score.desc.nullslast,view_count.desc` +
+        `&limit=${API_PAGE_SIZE}&offset=${offset}`;
+
+      const res = await apiInstance.get(url, { headers: { Prefer: "count=exact" } });
+      const rows = Array.isArray(res.data) ? res.data : [];
+      const list = rows.map(mapApiRow).filter(Boolean);
+      const total = parseTotal(res.headers && (res.headers["content-range"] || res.headers["Content-Range"]));
+
+      if (list.length) {
+        const pagecount = total ? Math.ceil(total / API_PAGE_SIZE) : page;
+        logInfo("search ok", { keyword, page, list: list.length, total });
+        return { page, pagecount, limit: API_PAGE_SIZE, total: total || list.length, list, keyword };
+      }
+    } catch (e) {
+      logError("search via animes table failed", e);
+    }
+  }
+
+  // 兜底：RPC 联想搜索（关键词含标点或上一步无结果时）
   try {
-    const { data: html } = await axiosInstance.get(`${HOST}/search?q=${encodeURIComponent(keyword)}`);
-    const list = extractCards(html);
-    logInfo("search ok", { keyword, list: list.length });
+    const list = await searchBySuggest(keyword);
+    logInfo("search ok (rpc)", { keyword, list: list.length });
     return {
-      page,
-      pagecount: list.length ? page : 0,
+      page: 1,
+      pagecount: list.length ? 1 : 0,
       limit: list.length,
       total: list.length,
       list,
