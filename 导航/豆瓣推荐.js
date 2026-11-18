@@ -2,8 +2,8 @@
 // @indexs 1
 // @author lampon
 // @description 豆瓣推荐爬虫脚本
-// @version 1.0.10
-// @downloadURL https://gh-proxy.org/https://github.com/zhao-wuyan/OmniBox-Spider/raw/refs/heads/fix/douban-sdk-3x-compat/导航/豆瓣推荐.js
+// @version 1.0.11
+// @downloadURL https://gh-proxy.org/https://github.com/zhao-wuyan/OmniBox-Spider/raw/refs/heads/fixed/导航/豆瓣推荐.js
 
 const OmniBox = require("omnibox_sdk");
 
