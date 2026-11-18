@@ -1,0 +1,14 @@
+动漫/稀饭动漫.js
+  h_dd364bd5be1770 5,26,28,575,578-579,583,593,598,601-602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c1c4b5c7d9cb6e7557a0c27d9514b322195122aa",
+  "prompts": {},
+  "humans": {
+    "h_dd364bd5be1770": {
+      "author": "zhao-wuyan <59789646+zhao-wuyan@users.noreply.github.com>"
+    }
+  }
+}
