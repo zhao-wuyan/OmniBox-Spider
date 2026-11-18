@@ -2,7 +2,7 @@
 // @author
 // @description 刮削：支持，弹幕：支持，播放记录：支持
 // @dependencies: axios, cheerio
-// @version 1.1.2
+// @version 1.1.3
 // @downloadURL https://gh-proxy.org/https://github.com/zhao-wuyan/OmniBox-Spider/raw/refs/heads/fixed/动漫/稀饭动漫.js
 
 /**
@@ -23,8 +23,9 @@
  *            因此优先用 SDK 的 sniffVideo 嗅探，失败则交给 OmniBox 解析
  *   - 搜索：站点 /search?q= 由前端渲染、服务端恒返回空列表，
  *          真正可用的搜索走它自己的 Supabase PostgREST：
- *          https://api.xifanacg.com/rest/v1/animes（支持中文/日文/拼音、分页、精确总数）
+ *          https://api.xifanacg.com/rest/v1/animes（支持中文/日文/拼音，取匹配度最高的前 24 条）
  *          兜底 https://api.xifanacg.com/rest/v1/rpc/suggest_animes
+ *          只做精准查询，不提供翻页
  *          key 不写死在脚本里：运行时从站点首页引用的 JS 中抓取（公开只读
  *          publishable key，非 JWT 无 exp），缓存 7 天；遇到 401 自动丢弃重抓并重试。
  *          也可用环境变量 XIFAN_API_KEY 手动指定（指定后不再自动抓取）。
@@ -571,33 +572,34 @@ async function searchBySuggest(keyword) {
 
 async function search(params = {}) {
   const keyword = String(params.keyword || params.key || params.wd || params.text || "").trim();
+  // 只做精准查询，不提供翻页：固定取匹配度最高的前 24 条
   const page = Math.max(Number(params.page || params.pg || 1) || 1, 1);
   if (!keyword) return { page, pagecount: 0, total: 0, limit: 0, list: [], keyword };
+  // 调用方要第 2 页及以后时直接返回空，避免重复返回第一页造成列表死循环
+  if (page > 1) return { page, pagecount: 1, total: 0, limit: 0, list: [], keyword };
 
   const safe = sanitizeKeyword(keyword);
 
-  // 主路径：直接查 animes 表，支持分页与精确总数
+  // 主路径：直接查 animes 表，一次取第一页
   if (safe) {
     try {
       const pattern = `*${safe}*`;
-      const offset = (page - 1) * API_PAGE_SIZE;
       const url =
         `${API_HOST}/rest/v1/animes?select=${SEARCH_SELECT}` +
         `&is_published=eq.true` +
         `&or=(search_title.ilike.${encodeURIComponent(pattern)},` +
         `pinyin_name.ilike.${encodeURIComponent(pattern)})` +
         `&order=bangumi_score.desc.nullslast,view_count.desc` +
-        `&limit=${API_PAGE_SIZE}&offset=${offset}`;
+        `&limit=${API_PAGE_SIZE}&offset=0`;
 
       const res = await apiGet(url, { Prefer: "count=exact" });
       const rows = Array.isArray(res.data) ? res.data : [];
       const list = rows.map(mapApiRow).filter(Boolean);
-      const total = parseTotal(res.headers && (res.headers["content-range"] || res.headers["Content-Range"]));
+      const matched = parseTotal(res.headers && (res.headers["content-range"] || res.headers["Content-Range"]));
 
       if (list.length) {
-        const pagecount = total ? Math.ceil(total / API_PAGE_SIZE) : page;
-        logInfo("search ok", { keyword, page, list: list.length, total });
-        return { page, pagecount, limit: API_PAGE_SIZE, total: total || list.length, list, keyword };
+        logInfo("search ok", { keyword, list: list.length, matched });
+        return { page: 1, pagecount: 1, limit: API_PAGE_SIZE, total: list.length, list, keyword };
       }
     } catch (e) {
       logError("search via animes table failed", e);
