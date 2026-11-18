@@ -2,7 +2,7 @@
 // @author
 // @description 刮削：支持，弹幕：支持，播放记录：支持
 // @dependencies: axios, cheerio
-// @version 1.1.1
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/zhao-wuyan/OmniBox-Spider/raw/refs/heads/fixed/动漫/稀饭动漫.js
 
 /**
@@ -25,6 +25,9 @@
  *          真正可用的搜索走它自己的 Supabase PostgREST：
  *          https://api.xifanacg.com/rest/v1/animes（支持中文/日文/拼音、分页、精确总数）
  *          兜底 https://api.xifanacg.com/rest/v1/rpc/suggest_animes
+ *          key 不写死在脚本里：运行时从站点首页引用的 JS 中抓取（公开只读
+ *          publishable key，非 JWT 无 exp），缓存 7 天；遇到 401 自动丢弃重抓并重试。
+ *          也可用环境变量 XIFAN_API_KEY 手动指定（指定后不再自动抓取）。
  * ============================================================================
  */
 
@@ -35,9 +38,16 @@ const runner = require("spider_runner");
 
 // 站点真实 SSR 域名。dm.xifanacg.com 对子路由一律回退到首页，不能用
 const HOST = "https://next.xifanacg.com";
-// 站点数据层是 Supabase，搜索/列表走它自己的 PostgREST（publishable key 为公开只读 key）
+// 站点数据层是 Supabase，搜索/列表走它自己的 PostgREST。
+// key 不写死在脚本里：站点前端本来就要用它建 Supabase 客户端，
+// 所以运行时从首页引用的 JS 里抓一个，缓存 7 天；401 时重新抓取。
+// 也支持用环境变量 XIFAN_API_KEY 手动指定（指定后不再自动抓取）。
 const API_HOST = "https://api.xifanacg.com";
-const API_KEY = "sb_publishable_OBIVAWACIX6lPXrO98_z24_HcsmalkA";
+const API_CACHE_KEY = "xifan:supabase-key";
+const API_KEY_TTL = 7 * 24 * 3600;
+let apiKey = String(process.env.XIFAN_API_KEY || "").trim();
+// 上次发现 key 的 chunk，命中时只需拉一个包（约 250KB）
+let apiKeyChunk = "";
 const API_PAGE_SIZE = 24;
 const SEARCH_SELECT = [
   "id",
@@ -71,13 +81,12 @@ const axiosInstance = axios.create({
 });
 
 // Supabase PostgREST 客户端（只读）。注意不能走 axios 的 params，
-// 否则逻辑树里的括号/逗号会被二次编码，PostgREST 解析报 PGRST100
+// 否则逻辑树里的括号/逗号会被二次编码，PostgREST 解析报 PGRST100。
+// apikey 不写死在这里，改由 apiHeaders() 逐请求注入，以便失效后热更新
 const apiInstance = axios.create({
   timeout: 20000,
   headers: {
     "User-Agent": UA,
-    apikey: API_KEY,
-    authorization: `Bearer ${API_KEY}`,
     "content-type": "application/json",
     Referer: HOST + "/",
   },
@@ -391,12 +400,168 @@ function parseTotal(contentRange) {
   return m ? Number(m[1]) : 0;
 }
 
+/** 每次请求动态注入 key，便于失效后热更新 */
+function apiHeaders(extra) {
+  return {
+    apikey: apiKey,
+    authorization: `Bearer ${apiKey}`,
+    ...(extra || {}),
+  };
+}
+
+/** 401/403 视为 key 失效 */
+function isAuthError(error) {
+  const resp = error && error.response;
+  if (resp && (resp.status === 401 || resp.status === 403)) return true;
+  const data = resp && resp.data;
+  const text = typeof data === "string" ? data : data && data.message ? String(data.message) : "";
+  return /unauthorized|invalid api key|no api key/i.test(text);
+}
+
+/**
+ * 从站点公开 JS 里重新抓 publishable key。
+ * 站点前端本来就要用它建 Supabase 客户端，所以 key 一定在某个 chunk 里。
+ */
+async function discoverApiKey() {
+  const tryChunk = async (path) => {
+    try {
+      const url = /^https?:\/\//i.test(path) ? path : HOST + path;
+      const { data } = await axiosInstance.get(url, {
+        headers: { Accept: "*/*" },
+        responseType: "text",
+      });
+      const m = String(data).match(/sb_publishable_[A-Za-z0-9_]+/);
+      return m ? { key: m[0], chunk: path } : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // 1) 先试已知 chunk（约 250KB）
+  if (apiKeyChunk) {
+    const hit = await tryChunk(apiKeyChunk);
+    if (hit) return hit;
+  }
+
+  // 2) 兜底：拉首页，扫描它引用的全部 chunk
+  try {
+    const { data: html } = await axiosInstance.get(`${HOST}/`);
+    const paths = Array.from(
+      new Set(String(html).match(/\/_next\/static\/chunks\/[A-Za-z0-9_.-]+\.js/g) || [])
+    );
+    for (let i = 0; i < paths.length; i += 6) {
+      const hit = (await Promise.all(paths.slice(i, i + 6).map(tryChunk))).find(Boolean);
+      if (hit) return hit;
+    }
+  } catch (e) {
+    logError("discover api key failed", e);
+  }
+  return null;
+}
+
+/* ---------------------------- key 获取与缓存 ---------------------------- */
+
+async function cacheGet(key) {
+  try {
+    return await OmniBox.getCache(key);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function cacheSet(key, value, ttl) {
+  try {
+    await OmniBox.setCache(key, value, ttl);
+  } catch (_) {}
+}
+
+async function cacheDelete(key) {
+  try {
+    await OmniBox.deleteCache(key);
+  } catch (_) {}
+}
+
+/** 从缓存恢复上次抓到的 key，避免每次请求都去扫 JS */
+async function loadCachedApiKey() {
+  const raw = await cacheGet(API_CACHE_KEY);
+  if (!raw) return false;
+  let obj = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch (_) {
+      return false;
+    }
+  }
+  const key = obj && typeof obj.key === "string" ? obj.key.trim() : "";
+  if (!/^sb_publishable_[A-Za-z0-9_]+$/.test(key)) return false;
+  apiKey = key;
+  apiKeyChunk = typeof obj.chunk === "string" ? obj.chunk : "";
+  return true;
+}
+
+async function saveCachedApiKey() {
+  await cacheSet(
+    API_CACHE_KEY,
+    JSON.stringify({ key: apiKey, chunk: apiKeyChunk, at: Date.now() }),
+    API_KEY_TTL
+  );
+}
+
+/** 保证 apiKey 可用：内存 -> 缓存 -> 现场抓取 */
+async function ensureApiKey() {
+  if (apiKey) return true;
+  if (await loadCachedApiKey()) return true;
+
+  const hit = await discoverApiKey();
+  if (!hit || !hit.key) {
+    logError("discover api key failed", "站点 JS 中未找到可用 key");
+    return false;
+  }
+  apiKey = hit.key;
+  apiKeyChunk = hit.chunk || "";
+  await saveCachedApiKey();
+  logInfo("api key discovered", { chunk: apiKeyChunk, tail: apiKey.slice(-6) });
+  return true;
+}
+
+/** key 失效时丢弃并重抓一次；成功返回 true */
+async function refreshApiKey() {
+  // 用户显式指定了环境变量时不自动改，避免覆盖用户设置
+  if (process.env.XIFAN_API_KEY) return false;
+  apiKey = "";
+  apiKeyChunk = "";
+  await cacheDelete(API_CACHE_KEY);
+  return ensureApiKey();
+}
+
+/** 统一入口：先确保有 key，401 时刷新并重试一次 */
+async function withApi(run) {
+  if (!(await ensureApiKey())) throw new Error("未获取到站点 API key");
+  try {
+    return await run();
+  } catch (e) {
+    if (isAuthError(e) && (await refreshApiKey())) return await run();
+    throw e;
+  }
+}
+
+/** 带鉴权失效重试的 GET */
+function apiGet(url, extraHeaders) {
+  return withApi(() => apiInstance.get(url, { headers: apiHeaders(extraHeaders) }));
+}
+
+/** 带鉴权失效重试的 POST */
+function apiPost(path, body, extraHeaders) {
+  return withApi(() => apiInstance.post(path, body, { headers: apiHeaders(extraHeaders) }));
+}
+
 /**
  * 兜底搜索：站点自带的联想 RPC，服务端匹配标题/原名/别名/拼音，
  * 对含标点的关键词最稳，但最多只返回 20 条且不能翻页。
  */
 async function searchBySuggest(keyword) {
-  const { data } = await apiInstance.post("/rest/v1/rpc/suggest_animes", {
+  const { data } = await apiPost("/rest/v1/rpc/suggest_animes", {
     q: keyword,
     lim: 24,
   });
@@ -424,7 +589,7 @@ async function search(params = {}) {
         `&order=bangumi_score.desc.nullslast,view_count.desc` +
         `&limit=${API_PAGE_SIZE}&offset=${offset}`;
 
-      const res = await apiInstance.get(url, { headers: { Prefer: "count=exact" } });
+      const res = await apiGet(url, { Prefer: "count=exact" });
       const rows = Array.isArray(res.data) ? res.data : [];
       const list = rows.map(mapApiRow).filter(Boolean);
       const total = parseTotal(res.headers && (res.headers["content-range"] || res.headers["Content-Range"]));
