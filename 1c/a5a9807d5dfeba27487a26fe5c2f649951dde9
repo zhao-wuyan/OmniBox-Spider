@@ -1,0 +1,14 @@
+影视/采集/爱奇艺资源站.js
+  h_dd364bd5be1770 3,5-6,29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1ca5a9807d5dfeba27487a26fe5c2f649951dde9",
+  "prompts": {},
+  "humans": {
+    "h_dd364bd5be1770": {
+      "author": "zhao-wuyan <59789646+zhao-wuyan@users.noreply.github.com>"
+    }
+  }
+}
